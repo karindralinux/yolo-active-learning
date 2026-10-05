@@ -25,6 +25,52 @@ yolo-mac-test/
 
 ---
 
+## 🛠️ Setup Python & Virtual Environment
+
+Butuh **Python 3.9 – 3.12** (cek dengan `python --version` atau `python3 --version`).
+
+### macOS / Linux (Unix-based)
+```bash
+# 1. Buat virtual environment
+python3 -m venv venv
+
+# 2. Aktifkan
+source venv/bin/activate
+
+# 3. Install dependensi
+pip install --upgrade pip
+pip install ultralytics opencv-python pyyaml
+```
+
+### Windows (PowerShell)
+```powershell
+# 1. Buat virtual environment
+python -m venv venv
+
+# 2. Aktifkan
+.\venv\Scripts\Activate.ps1
+
+# 3. Install dependensi
+python -m pip install --upgrade pip
+pip install ultralytics opencv-python pyyaml
+```
+
+### Windows (Command Prompt / cmd)
+```bat
+python -m venv venv
+venv\Scripts\activate.bat
+pip install ultralytics opencv-python pyyaml
+```
+
+> **Catatan Windows:** Jika PowerShell menolak menjalankan `Activate.ps1`, jalankan sekali:
+> `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+
+> **Catatan:** `ultralytics` otomatis meng-install PyTorch. Di Mac Apple Silicon akan memakai `mps`, di Windows/Linux dengan GPU NVIDIA memakai CUDA (jika PyTorch versi CUDA terpasang), selain itu jatuh ke CPU.
+
+Untuk keluar dari venv, jalankan `deactivate`. Pada panduan di bawah, perintah `source venv/bin/activate` diganti dengan perintah aktivasi Windows di atas jika Anda memakai Windows.
+
+---
+
 ## 📚 Tahapan Belajar
 
 ### Tahap 1: Inferensi Dasar dengan Webcam (`simple_yolo_stream.py`)

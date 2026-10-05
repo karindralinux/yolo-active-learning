@@ -14,6 +14,8 @@ Pendekatan "Paling Tidak Merepotkan" (Plug & Play):
 """
 
 import os
+import time
+from datetime import datetime
 import shutil
 import glob
 import torch
@@ -55,6 +57,11 @@ else:
     DEVICE = "cpu"
 
 
+def log(message, level="INFO"):
+    """Print log dengan timestamp agar setiap proses mudah dilacak."""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}", flush=True)
+
+
 # ==============================================================================
 # 2. PERSIAPAN DATASET SIMULASI (SIMULATED ORACLE SETUP)
 # ==============================================================================
@@ -71,6 +78,7 @@ def prepare_simulation_environment():
     print("="*60)
     
     # 1. Pastikan coco128 tersedia
+    log("Memeriksa/mengunduh dataset coco128...")
     dataset_info = check_det_dataset("coco128.yaml")
     coco_path = dataset_info["path"]
     src_images = sorted(glob.glob(os.path.join(coco_path, "images", "train2017", "*.jpg")))
@@ -81,7 +89,9 @@ def prepare_simulation_environment():
     
     # 2. Reset folder kerja simulasi agar selalu bersih & idempoten
     if os.path.exists(SIM_DIR):
+        log(f"Menghapus folder simulasi lama: {SIM_DIR}", "WARN")
         shutil.rmtree(SIM_DIR)
+    log(f"Membuat struktur folder simulasi di: {SIM_DIR}")
         
     for d in [TRAIN_IMG_DIR, TRAIN_LBL_DIR, VAL_IMG_DIR, VAL_LBL_DIR, POOL_IMG_DIR, ORACLE_VAULT_DIR]:
         os.makedirs(d, exist_ok=True)
@@ -93,6 +103,7 @@ def prepare_simulation_environment():
     val_files = src_images[:VAL_SIZE]
     seed_files = src_images[VAL_SIZE:VAL_SIZE + SEED_SIZE]
     pool_files = src_images[VAL_SIZE + SEED_SIZE:]
+    log(f"Pembagian data -> val: {len(val_files)}, seed: {len(seed_files)}, pool: {len(pool_files)}")
     
     # Isi Val Set (beserta label)
     for img_path in val_files:
@@ -121,7 +132,10 @@ def prepare_simulation_environment():
         if os.path.exists(lbl_path):
             shutil.copy(lbl_path, os.path.join(ORACLE_VAULT_DIR, lbl_name))
             
+    log(f"Label asli {len(pool_files)} gambar pool disimpan ke Oracle Vault.")
+
     # 4. Buat dataset.yaml dinamis dengan 80 class COCO
+    log(f"Menulis dataset.yaml di: {DATASET_YAML_PATH}")
     yaml_dict = {
         "path": os.path.abspath(SIM_DIR),
         "train": "images/train",
@@ -147,19 +161,23 @@ def calculate_uncertainty(model, image_path):
     - Jika tidak ada deteksi: Skor = 1.0 (potensi False Negative tinggi)
     - Jika ada deteksi: Skor = 1.0 - max(confidence_score)
     Semakin tinggi skor, semakin ragu model terhadap gambar tersebut.
+
+    Return: (skor_uncertainty, jumlah_deteksi, max_confidence)
     """
     results = model.predict(image_path, verbose=False, device=DEVICE)
     boxes = results[0].boxes
     if len(boxes) == 0:
-        return 1.0
+        return 1.0, 0, 0.0
     max_conf = float(torch.max(boxes.conf).item())
-    return 1.0 - max_conf
+    return 1.0 - max_conf, len(boxes), max_conf
 
 
 # ==============================================================================
 # 4. ACTIVE LEARNING MAIN LOOP
 # ==============================================================================
 def run_active_learning_simulation():
+    start_time = time.time()
+    log(f"Memulai simulasi Active Learning | device={DEVICE} | iterasi={ITERATIONS} | budget={BUDGET_PER_ITER} | epochs={EPOCHS_PER_ITER}")
     prepare_simulation_environment()
     
     # Inisialisasi model dari bobot nano pre-trained
@@ -167,6 +185,7 @@ def run_active_learning_simulation():
     if not os.path.exists(model_path):
         model_path = "yolov8n.pt"
     
+    log(f"Memuat model awal dari: {model_path}")
     model = YOLO(model_path)
     
     # Riwayat metrik evaluasi
@@ -177,6 +196,7 @@ def run_active_learning_simulation():
     print("="*60)
     
     # Evaluasi performa awal model pada Validation Set
+    log("Mengevaluasi model baseline pada Validation Set...")
     val_results = model.val(data=DATASET_YAML_PATH, split="val", verbose=False, device=DEVICE)
     base_map50 = float(val_results.box.map50)
     base_map = float(val_results.box.map)
@@ -202,26 +222,50 @@ def run_active_learning_simulation():
         
         pool_images = sorted([f for f in os.listdir(POOL_IMG_DIR) if f.endswith(('.jpg', '.png'))])
         if len(pool_images) == 0:
-            print("Pool data telah habis! Menghentikan siklus.")
+            log("Pool data telah habis! Menghentikan siklus.", "WARN")
             break
             
         # --- Tahap 1: Inferensi & Perhitungan Uncertainty di Pool Data ---
-        print(f"-> Melakukan inferensi & scoring pada {len(pool_images)} gambar di pool...")
+        log(f"Melakukan inferensi & scoring pada {len(pool_images)} gambar di pool...")
         scored_images = []
-        for img_name in pool_images:
+        stats = {}
+        for idx, img_name in enumerate(pool_images, 1):
             img_path = os.path.join(POOL_IMG_DIR, img_name)
-            score = calculate_uncertainty(model, img_path)
+            score, n_det, max_conf = calculate_uncertainty(model, img_path)
             scored_images.append((img_name, score))
+            stats[img_name] = (n_det, max_conf)
+            if idx % 20 == 0 or idx == len(pool_images):
+                log(f"Progres scoring: {idx}/{len(pool_images)} gambar")
             
         # Urutkan berdasarkan ketidakpastian tertinggi (descending)
         scored_images.sort(key=lambda x: x[1], reverse=True)
         
+        no_det = sum(1 for n, _ in stats.values() if n == 0)
+        log(f"Hasil scoring: {no_det} gambar tanpa deteksi sama sekali dari {len(pool_images)} gambar pool.")
+        
         # Ambil Top-K sampel sesuai anggaran (budget)
         selected_batch = scored_images[:BUDGET_PER_ITER]
-        print(f"-> Memilih {len(selected_batch)} sampel paling meragukan (Uncertainty: {selected_batch[0][1]:.3f} ~ {selected_batch[-1][1]:.3f})")
+        log(f"Memilih {len(selected_batch)} sampel paling meragukan (Uncertainty: {selected_batch[0][1]:.3f} ~ {selected_batch[-1][1]:.3f})")
+        
+        # Log gambar dengan confidence rendah yang terpilih
+        log("Daftar gambar dengan confidence RENDAH (dipilih untuk dilabeli):")
+        print(f"    {'No':<4} {'Gambar':<20} {'Uncertainty':<12} {'Max Conf':<10} {'Deteksi':<8}")
+        print("    " + "-"*58)
+        for rank, (img_name, score) in enumerate(selected_batch, 1):
+            n_det, max_conf = stats[img_name]
+            note = "  <- tidak ada deteksi" if n_det == 0 else ""
+            print(f"    {rank:<4} {img_name:<20} {score:<12.3f} {max_conf:<10.3f} {n_det:<8}{note}")
+        
+        # Sebagai perbandingan: gambar yang paling yakin (tidak dipilih)
+        most_confident = scored_images[-3:][::-1] if len(scored_images) > BUDGET_PER_ITER else []
+        if most_confident:
+            log("Pembanding - gambar dengan confidence TERTINGGI (tidak dipilih):")
+            for img_name, score in most_confident:
+                n_det, max_conf = stats[img_name]
+                print(f"    {img_name:<20} uncertainty={score:.3f} max_conf={max_conf:.3f} deteksi={n_det}")
         
         # --- Tahap 2: Simulasi Human-in-the-Loop (Oracle Vault) ---
-        print("-> [Simulated Oracle] Memindahkan gambar & membuka anotasi ground-truth...")
+        log("[Simulated Oracle] Memindahkan gambar & membuka anotasi ground-truth...")
         for img_name, score in selected_batch:
             # Pindahkan gambar dari Pool ke Train
             src_img = os.path.join(POOL_IMG_DIR, img_name)
@@ -234,13 +278,16 @@ def run_active_learning_simulation():
             dst_lbl = os.path.join(TRAIN_LBL_DIR, lbl_name)
             if os.path.exists(src_lbl):
                 shutil.move(src_lbl, dst_lbl)
+                log(f"  {img_name}: gambar & label dipindah Pool -> Train")
+            else:
+                log(f"  {img_name}: label tidak ditemukan di Oracle Vault (gambar tanpa objek)", "WARN")
                 
         new_train_count = len(os.listdir(TRAIN_IMG_DIR))
         new_pool_count = len(os.listdir(POOL_IMG_DIR))
-        print(f"-> Data Train kini: {new_train_count} gambar | Sisa Pool: {new_pool_count} gambar")
+        log(f"Data Train kini: {new_train_count} gambar | Sisa Pool: {new_pool_count} gambar")
         
         # --- Tahap 3: Retraining Inkremental ---
-        print(f"-> Memulai retraining inkremental ({EPOCHS_PER_ITER} epoch)...")
+        log(f"Memulai retraining inkremental ({EPOCHS_PER_ITER} epoch)...")
         train_run = model.train(
             data=DATASET_YAML_PATH,
             epochs=EPOCHS_PER_ITER,
@@ -254,12 +301,14 @@ def run_active_learning_simulation():
         )
         
         # Checkpoint model terbaik siklus ini
+        log(f"Retraining siklus {cycle} selesai.")
         best_cycle_weight = os.path.join(PROJECT_ROOT, "runs", "al_simulation", f"cycle_{cycle}", "weights", "best.pt")
         if os.path.exists(best_cycle_weight):
             best_weights_path = best_cycle_weight
             model = YOLO(best_weights_path)
             
         # --- Tahap 4: Evaluasi pada Fixed Val Set ---
+        log(f"Mengevaluasi model siklus {cycle} pada Validation Set...")
         val_res = model.val(data=DATASET_YAML_PATH, split="val", verbose=False, device=DEVICE)
         c_map50 = float(val_res.box.map50)
         c_map = float(val_res.box.map)
@@ -271,7 +320,8 @@ def run_active_learning_simulation():
             "map50": c_map50,
             "map50_95": c_map
         })
-        print(f"Siklus {cycle} Selesai -> mAP50: {c_map50:.4f} | mAP50-95: {c_map:.4f}")
+        delta = c_map50 - history[-2]["map50"]
+        log(f"Siklus {cycle} Selesai -> mAP50: {c_map50:.4f} ({delta:+.4f} vs sebelumnya) | mAP50-95: {c_map:.4f}")
 
     # ==============================================================================
     # 5. RINGKASAN HASIL & SIMPAN MODEL
@@ -290,6 +340,7 @@ def run_active_learning_simulation():
     print(divider)
     
     # Simpan bobot final yang mudah diakses
+    log(f"Total waktu simulasi: {time.time() - start_time:.1f} detik")
     final_output_model = os.path.join(WORKSPACE_DIR, "best_al_model.pt")
     if os.path.exists(best_weights_path):
         shutil.copy(best_weights_path, final_output_model)
